@@ -1,34 +1,66 @@
 import torch
 import torch.onnx
 import os
-from diffusers import StableDiffusionPipeline, UNet2DConditionModel, AutoencoderKL, DDIMScheduler
+import sys
+from diffusers import StableDiffusionPipeline, UNet2DConditionModel, AutoencoderKL
 from transformers import CLIPTextModel, CLIPTokenizer
 import argparse
 import logging
 import subprocess
+import shutil
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# --- Model Loading ---
-def load_pytorch_models(model_id):
-    """Loads necessary PyTorch models from Hugging Face Hub."""
-    logger.info(f"Loading PyTorch models from {model_id}...")
-    scheduler = DDIMScheduler.from_pretrained(model_id, subfolder="scheduler")
-    tokenizer = CLIPTokenizer.from_pretrained(model_id, subfolder="tokenizer")
-    text_encoder = CLIPTextModel.from_pretrained(model_id, subfolder="text_encoder")
-    unet = UNet2DConditionModel.from_pretrained(model_id, subfolder="unet")
-    vae = AutoencoderKL.from_pretrained(model_id, subfolder="vae")
-    logger.info("PyTorch models loaded.")
-    return scheduler, tokenizer, text_encoder, unet, vae
 
-# --- Export Function ---
-def export_models(model_id, batch_size, height, width, output_dir, opset=17, skip_existing=True, compile_iree=True, iree_target_backend='llvm-cpu'):
-    """Exports UNet, Text Encoder, and VAE Decoder to ONNX format and optionally compiles to IREE VMFB."""
+def load_pytorch_models(model_id):
+    """Loads necessary PyTorch models from Hugging Face Hub.
+    
+    Args:
+        model_id: Hugging Face model ID
+        
+    Returns:
+        tuple: (tokenizer, text_encoder, unet, vae)
+        
+    Raises:
+        Exception: If models cannot be loaded
+    """
+    try:
+        logger.info(f"Loading PyTorch models from {model_id}...")
+        tokenizer = CLIPTokenizer.from_pretrained(model_id, subfolder="tokenizer")
+        text_encoder = CLIPTextModel.from_pretrained(model_id, subfolder="text_encoder")
+        unet = UNet2DConditionModel.from_pretrained(model_id, subfolder="unet")
+        vae = AutoencoderKL.from_pretrained(model_id, subfolder="vae")
+        logger.info("PyTorch models loaded.")
+        return tokenizer, text_encoder, unet, vae
+    except Exception as e:
+        logger.error(f"Error loading PyTorch models: {e}")
+        raise
+
+
+
+def export_models(model_id, batch_size, height, width, output_dir, opset=17, skip_existing=True, compile_iree=True, iree_target_backend='cuda'):
+    """Exports UNet, Text Encoder, and VAE Decoder to ONNX format and optionally compiles to IREE VMFB.
+    
+    Args:
+        model_id: Hugging Face model ID
+        batch_size: Batch size for inference
+        height: Image height
+        width: Image width
+        output_dir: Directory to save models
+        opset: ONNX opset version
+        skip_existing: Skip export if files exist
+        compile_iree: Whether to compile to IREE VMFB
+        iree_target_backend: IREE target backend
+        
+    Returns:
+        bool: True if successful, False otherwise
+    """
+    
     os.makedirs(output_dir, exist_ok=True)
 
-    # --- Define Paths --- 
+    
     unet_onnx_path = os.path.join(output_dir, 'unet.onnx')
     text_encoder_onnx_path = os.path.join(output_dir, 'text_encoder.onnx')
     vae_decoder_onnx_path = os.path.join(output_dir, 'vae_decoder.onnx')
@@ -36,7 +68,7 @@ def export_models(model_id, batch_size, height, width, output_dir, opset=17, ski
     text_encoder_vmfb_path = os.path.join(output_dir, f'text_encoder_{iree_target_backend}.vmfb')
     vae_decoder_vmfb_path = os.path.join(output_dir, f'vae_decoder_{iree_target_backend}.vmfb')
 
-    # Check if all final target files exist if skip_existing is True
+    
     all_targets_exist = (
         os.path.exists(unet_onnx_path) and
         os.path.exists(text_encoder_onnx_path) and
@@ -46,183 +78,232 @@ def export_models(model_id, batch_size, height, width, output_dir, opset=17, ski
 
     if skip_existing and all_targets_exist:
         logger.info(f"All target ONNX and IREE VMFB files already exist in {output_dir}. Skipping export and compilation.")
-        return
+        return True
 
-    # --- Load PyTorch Models (only if needed) ---
-    scheduler, tokenizer, text_encoder, unet, vae = load_pytorch_models(model_id)
+    
+    try:
+        tokenizer, text_encoder, unet, vae = load_pytorch_models(model_id)
+    except Exception as e:
+        logger.error(f"Failed to load models: {e}")
+        return False
 
-    # --- Dummy Inputs (only if needed for export) ---
+    
     export_needed = (
         not os.path.exists(unet_onnx_path) or
         not os.path.exists(text_encoder_onnx_path) or
         not os.path.exists(vae_decoder_onnx_path)
     )
     if export_needed:
-        logger.info("Generating dummy inputs for ONNX export...")
-        latent_channels = unet.config.in_channels
-        embedding_dim = text_encoder.config.hidden_size
-        model_max_length = tokenizer.model_max_length
-        vae_latent_channels = vae.config.latent_channels
-        image_height, image_width = height, width
+        try:
+            logger.info("Generating dummy inputs for ONNX export...")
+            latent_channels = unet.config.in_channels
+            embedding_dim = text_encoder.config.hidden_size
+            model_max_length = tokenizer.model_max_length
+            vae_latent_channels = vae.config.latent_channels
+            image_height, image_width = height, width
 
-        unet_inference_batch_size = batch_size * 2 # Doubled for CFG
-        dummy_sample = torch.randn(unet_inference_batch_size, latent_channels, image_height // 8, image_width // 8, dtype=torch.float32)
-        dummy_timestep = torch.tensor(999, dtype=torch.float32)
-        dummy_encoder_hidden_states = torch.randn(unet_inference_batch_size, model_max_length, embedding_dim, dtype=torch.float32)
+            unet_inference_batch_size = batch_size * 2 
+            dummy_sample = torch.randn(unet_inference_batch_size, latent_channels, image_height // 8, image_width // 8, dtype=torch.float32)
+            dummy_timestep = torch.tensor(999, dtype=torch.float32)
+            dummy_encoder_hidden_states = torch.randn(unet_inference_batch_size, model_max_length, embedding_dim, dtype=torch.float32)
 
-        dummy_text_input_ids = tokenizer(["dummy prompt"] * batch_size, padding="max_length", max_length=model_max_length, truncation=True, return_tensors="pt").input_ids
+            dummy_text_input_ids = tokenizer(["dummy prompt"] * batch_size, padding="max_length", max_length=model_max_length, truncation=True, return_tensors="pt").input_ids
 
-        dummy_latents_for_vae = torch.randn(batch_size, vae_latent_channels, image_height // 8, image_width // 8, dtype=torch.float32)
-        logger.info("Dummy inputs generated.")
+            dummy_latents_for_vae = torch.randn(batch_size, vae_latent_channels - 1, image_height // 8, image_width // 8, dtype=torch.float32)
+            logger.info("Dummy inputs generated.")
+        except Exception as e:
+            logger.error(f"Error generating dummy inputs: {e}")
+            return False
 
-    # --- Export UNet to ONNX ---
+    
+    unet_exported = False
     if not skip_existing or not os.path.exists(unet_onnx_path):
-        logger.info(f"Exporting UNet to {unet_onnx_path} with opset {opset}...")
-        unet.eval()
         try:
-            example_inputs_unet = (dummy_sample, dummy_timestep, dummy_encoder_hidden_states)
-            torch.onnx.export(
-                unet,
-                example_inputs_unet,
-                unet_onnx_path,
-                input_names=['sample', 'timestep', 'encoder_hidden_states'],
-                output_names=['out_sample'],
-                dynamic_axes={
-                    'sample': {0: 'batch_size'}, 
-                    'encoder_hidden_states': {0: 'batch_size'} 
-                },
-                opset_version=opset
-            )
-            logger.info(f"UNet ONNX model saved to {unet_onnx_path}")
+            logger.info(f"Exporting UNet to {unet_onnx_path} with opset {opset}...")
+            unet.eval()
+            
+            
+            dynamic_axes = {
+                "sample": {0: "batch"},
+                "timestep": {},
+                "encoder_hidden_states": {0: "batch"},
+                "out_sample": {0: "batch"},
+            }
+            
+            
+            with torch.no_grad():
+                torch.onnx.export(
+                    unet,
+                    (dummy_sample, dummy_timestep, dummy_encoder_hidden_states),
+                    unet_onnx_path,
+                    input_names=["sample", "timestep", "encoder_hidden_states"],
+                    output_names=["out_sample"],
+                    dynamic_axes=dynamic_axes,
+                    opset_version=opset,
+                )
+            logger.info(f"UNet exported to {unet_onnx_path}.")
+            unet_exported = True
         except Exception as e:
-            logger.error(f"ERROR exporting UNet to ONNX: {e}")
-            raise
-    else:
-        logger.info(f"UNet ONNX model already exists at {unet_onnx_path}. Skipping export.")
+            logger.error(f"Error exporting UNet: {e}")
 
-    # --- Export Text Encoder to ONNX ---
+    
+    text_encoder_exported = False
     if not skip_existing or not os.path.exists(text_encoder_onnx_path):
-        logger.info(f"Exporting Text Encoder to {text_encoder_onnx_path} with opset {opset}...")
-        text_encoder.eval()
         try:
-            torch.onnx.export(
-                text_encoder,
-                (dummy_text_input_ids,), 
-                text_encoder_onnx_path,
-                input_names=['input_ids'],
-                output_names=['last_hidden_state'], 
-                dynamic_axes={'input_ids': {0: 'batch_size'}}, 
-                opset_version=opset
-            )
-            logger.info(f"Text Encoder ONNX model saved to {text_encoder_onnx_path}")
+            logger.info(f"Exporting Text Encoder to {text_encoder_onnx_path} with opset {opset}...")
+            text_encoder.eval()
+            
+            
+            dynamic_axes = {
+                "input_ids": {0: "batch"},
+                "last_hidden_state": {0: "batch"},
+            }
+            
+            
+            with torch.no_grad():
+                torch.onnx.export(
+                    text_encoder,
+                    dummy_text_input_ids,
+                    text_encoder_onnx_path,
+                    input_names=["input_ids"],
+                    output_names=["last_hidden_state"],
+                    dynamic_axes=dynamic_axes,
+                    opset_version=opset,
+                )
+            logger.info(f"Text Encoder exported to {text_encoder_onnx_path}.")
+            text_encoder_exported = True
         except Exception as e:
-            logger.error(f"ERROR exporting Text Encoder to ONNX: {e}")
-            raise
-    else:
-        logger.info(f"Text Encoder ONNX model already exists at {text_encoder_onnx_path}. Skipping export.")
+            logger.error(f"Error exporting Text Encoder: {e}")
 
-    # --- Export VAE Decoder to ONNX ---
+    
+
+    vae_decoder_exported = False
     if not skip_existing or not os.path.exists(vae_decoder_onnx_path):
-        logger.info(f"Exporting VAE Decoder to {vae_decoder_onnx_path} with opset {opset}...")
-        vae.eval()
-        class VAEDecodeWrapper(torch.nn.Module):
-                def __init__(self, vae_model):
-                    super().__init__()
-                    self.vae = vae_model
-                def forward(self, latents):
-                    return self.vae.decode(latents).sample
-
-        vae_wrapper = VAEDecodeWrapper(vae)
-        vae_wrapper.eval()
-
         try:
-            torch.onnx.export(
-                vae_wrapper,
-                (dummy_latents_for_vae,),
-                vae_decoder_onnx_path,
-                input_names=['latent_sample'],
-                output_names=['sample'],
-                dynamic_axes={'latent_sample': {0: 'batch_size'}}, 
-                opset_version=opset
-            )
-            logger.info(f"VAE Decoder ONNX model saved to {vae_decoder_onnx_path}")
+            logger.info(f"Exporting VAE Decoder to {vae_decoder_onnx_path} with opset {opset}...")
+            
+            
+            dynamic_axes = {
+                "latents": {0: "batch"},
+                "images": {0: "batch"},
+            }
+            
+            
+            with torch.no_grad():
+                torch.onnx.export(
+                    vae,
+                    dummy_latents_for_vae,
+                    vae_decoder_onnx_path,
+                    input_names=["latents"],
+                    output_names=["images"],
+                    dynamic_axes=dynamic_axes,
+                    opset_version=opset,
+                )
+            logger.info(f"VAE Decoder exported to {vae_decoder_onnx_path}.")
+            vae_decoder_exported = True
         except Exception as e:
-            logger.error(f"ERROR exporting VAE Decoder to ONNX: {e}")
-            raise
-    else:
-        logger.info(f"VAE Decoder ONNX model already exists at {vae_decoder_onnx_path}. Skipping export.")
+            logger.error(f"Error exporting VAE Decoder: {e}")
 
-    logger.info("ONNX export process completed (or skipped).")
-
-    # --- Compile ONNX to IREE VMFB --- 
+    
     if compile_iree:
-        logger.info("Starting IREE import and compilation...")
-        models_to_process = {
-            "UNet": (unet_onnx_path, unet_vmfb_path),
-            "TextEncoder": (text_encoder_onnx_path, text_encoder_vmfb_path),
-            "VAEDecoder": (vae_decoder_onnx_path, vae_decoder_vmfb_path)
-        }
-
-        for name, (onnx_path, vmfb_path) in models_to_process.items():
-            # Define MLIR path
-            mlir_path = onnx_path.replace(".onnx", ".mlir")
-
-            # Check if final VMFB exists first (most efficient skip)
+        logger.info("\n--- Starting IREE Compilation ---")
+        
+        
+        compilation_results = {}
+        
+        
+        compilation_jobs = [
+            {
+                "name": "unet",
+                "onnx_path": unet_onnx_path,
+                "mlir_path": os.path.join(output_dir, "unet.mlir"),
+                "vmfb_path": unet_vmfb_path,
+                "exported": unet_exported or (skip_existing and os.path.exists(unet_onnx_path))
+            },
+            {
+                "name": "text_encoder",
+                "onnx_path": text_encoder_onnx_path,
+                "mlir_path": os.path.join(output_dir, "text_encoder.mlir"),
+                "vmfb_path": text_encoder_vmfb_path,
+                "exported": text_encoder_exported or (skip_existing and os.path.exists(text_encoder_onnx_path))
+            },
+            {
+                "name": "vae_decoder",
+                "onnx_path": vae_decoder_onnx_path,
+                "mlir_path": os.path.join(output_dir, "vae_decoder.mlir"),
+                "vmfb_path": vae_decoder_vmfb_path,
+                "exported": vae_decoder_exported or (skip_existing and os.path.exists(vae_decoder_onnx_path))
+            }
+        ]
+        
+        
+        for job in compilation_jobs:
+            name = job["name"]
+            onnx_path = job["onnx_path"]
+            mlir_path = job["mlir_path"]
+            vmfb_path = job["vmfb_path"]
+            exported = job["exported"]
+            
+            compilation_results[name] = {
+                "import": False,
+                "compile": False
+            }
+            
+            if not exported:
+                logger.warning(f"Skipping {name} compilation as ONNX export failed or was skipped.")
+                continue
+                
             if skip_existing and os.path.exists(vmfb_path):
-                 logger.info(f"IREE VMFB file {vmfb_path} already exists. Skipping import and compilation for {name}.")
-                 continue
+                logger.info(f"{name} VMFB already exists at {vmfb_path}. Skipping compilation.")
+                compilation_results[name]["import"] = True
+                compilation_results[name]["compile"] = True
+                continue
 
-            # --- Import ONNX to MLIR --- 
-            # Check if ONNX input exists before attempting import
-            if not os.path.exists(onnx_path):
-                 logger.error(f"Cannot import {name}: ONNX file {onnx_path} not found.")
-                 continue
-
-            # Check if MLIR needs to be generated
-            if not skip_existing or not os.path.exists(mlir_path):
-                logger.info(f"Importing {name} ONNX from {onnx_path} to MLIR at {mlir_path}...")
+            
+            if not os.path.exists(mlir_path) or not skip_existing:
+                logger.info(f"Importing {name} ONNX from {onnx_path} to MLIR...")
                 import_command = [
                     'uv', 'run',
                     'iree-import-onnx',
-                    onnx_path,
+                    onnx_path, 
                     '--opset-version', '17',
-                    '-o',
-                    mlir_path
+                    '-o', mlir_path 
                 ]
                 try:
                     import_result = subprocess.run(import_command, check=True, capture_output=True, text=True)
-                    logger.info(f"Successfully imported {name} to {mlir_path}.")
+                    logger.info(f"Successfully imported {name} ONNX to MLIR.")
                     logger.debug(f"IREE Import Output:\n{import_result.stdout}")
                     if import_result.stderr:
-                        logger.warning(f"IREE Import stderr:\n{import_result.stderr}")
+                        logger.debug(f"IREE Import stderr:\n{import_result.stderr}")
+                    compilation_results[name]["import"] = True
                 except subprocess.CalledProcessError as e:
-                    logger.error(f"ERROR importing {name} ONNX to MLIR: {e}")
+                    logger.error(f"ERROR importing {name} ONNX with IREE: {e}") 
                     logger.error(f"Command: {' '.join(e.cmd)}")
                     logger.error(f"Stderr: {e.stderr}")
-                    continue # Skip compilation if import fails
+                    continue 
                 except FileNotFoundError:
                     logger.error(f"ERROR: 'iree-import-onnx' command not found. Make sure IREE is installed and in your PATH.")
-                    continue # Skip compilation if import command not found
+                    continue 
             else:
                  logger.info(f"MLIR file {mlir_path} already exists. Skipping import for {name}.")
+                 compilation_results[name]["import"] = True
             
-            # --- Compile MLIR to IREE VMFB ---
-            # Check if MLIR input exists before attempting compile (might have failed import)
+            
+            
             if not os.path.exists(mlir_path):
                  logger.error(f"Cannot compile {name}: MLIR file {mlir_path} not found (import might have failed).")
                  continue
 
-            # VMFB existence check already done at the top, so just compile if needed
+            
             logger.info(f"Compiling {name} MLIR from {mlir_path} to {vmfb_path} for target {iree_target_backend}...")
             compile_command = [
                 'uv', 'run',
                 'iree-compile',
-                '--iree-hal-target-device=local',
-                '--iree-hal-local-target-device-backends=llvm-cpu',
-                '--iree-llvmcpu-target-cpu=host',
-                '--iree-opt-level=O1',
-                '--iree-llvmcpu-target-cpu-features=host',
-                mlir_path, # Use MLIR path as input
+                '--iree-hal-target-device=cuda',
+                
+                
+                '--iree-opt-level=O2',
+                mlir_path, 
                 '-o',
                 vmfb_path
             ]
@@ -231,16 +312,36 @@ def export_models(model_id, batch_size, height, width, output_dir, opset=17, ski
                 logger.info(f"Successfully compiled {name} to {vmfb_path}.")
                 logger.debug(f"IREE Compile Output:\n{compile_result.stdout}")
                 if compile_result.stderr:
-                    logger.warning(f"IREE Compile stderr:\n{compile_result.stderr}")
+                    logger.debug(f"IREE Compile stderr:\n{compile_result.stderr}")
+                compilation_results[name]["compile"] = True
             except subprocess.CalledProcessError as e:
-                logger.error(f"ERROR compiling {name} MLIR with IREE: {e}") # Updated error message
+                logger.error(f"ERROR compiling {name} MLIR with IREE: {e}")
                 logger.error(f"Command: {' '.join(e.cmd)}")
                 logger.error(f"Stderr: {e.stderr}")
             except FileNotFoundError:
                  logger.error(f"ERROR: 'iree-compile' command not found. Make sure IREE is installed and in your PATH.")
-                 # Don't break the loop, other models might compile
         
-        logger.info("IREE import and compilation process completed (or skipped).") # Updated log
+        
+        logger.info("\n=== IREE Compilation Summary ===")
+        all_successful = True
+        for name, result in compilation_results.items():
+            status = "✓ Success" if result["import"] and result["compile"] else "❌ Failed"
+            logger.info(f"{name}: {status}")
+            if not (result["import"] and result["compile"]):
+                all_successful = False
+        
+        if not all_successful and not skip_existing:
+            logger.warning("Some models failed to compile. Check logs for details.")
+        
+        return all_successful
+    else:
+        
+        all_exported = unet_exported and text_encoder_exported and vae_decoder_exported
+        if not all_exported and not skip_existing:
+            logger.warning("Some models failed to export to ONNX. Check logs for details.")
+        
+        return all_exported
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Export Stable Diffusion models to ONNX and optionally compile to IREE.")
@@ -252,11 +353,11 @@ if __name__ == "__main__":
     parser.add_argument("--opset", type=int, default=17, help="ONNX opset version.")
     parser.add_argument("--skip_existing", action='store_true', help="Skip export/compilation if target files exist.")
     parser.add_argument("--no_iree", action='store_true', help="Do not compile ONNX models to IREE VMFB.")
-    parser.add_argument("--iree_target", type=str, default="llvm-cpu", help="IREE target backend (e.g., llvm-cpu, vulkan, cuda).")
+    parser.add_argument("--iree_target", type=str, default="cuda", help="IREE target backend (e.g., cuda, vulkan, cuda).")
 
     args = parser.parse_args()
 
-    export_models(
+    success = export_models(
         model_id=args.model_id,
         batch_size=args.batch_size,
         height=args.height,
@@ -267,3 +368,5 @@ if __name__ == "__main__":
         compile_iree=not args.no_iree,
         iree_target_backend=args.iree_target
     )
+    
+    sys.exit(0 if success else 1)

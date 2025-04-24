@@ -26,7 +26,6 @@ def _multiply_sigma(latents: np.ndarray, sigma):
 
 
 def run_iree_inference(
-    *,
     model_id: str,
     vmfb_dir: str,
     prompt: str,
@@ -36,19 +35,19 @@ def run_iree_inference(
     num_inference_steps: int,
     guidance_scale: float,
     output_image_prefix: str,
-    iree_target_backend: str = "llvm-cpu",
-    iree_device: str = "local-task",
+    iree_target_backend: str = "cuda",
+    iree_device: str = "cuda",
 ) -> Optional[float]:
     """Runs SD inference using compiled IREE VMFB modules."""
     logger.info("Starting IREE inference...")
 
-    # --- Load scheduler / tokenizer
+    
     scheduler = PNDMScheduler.from_pretrained(model_id, subfolder="scheduler")
     tokenizer = CLIPTokenizer.from_pretrained(model_id, subfolder="tokenizer")
 
     vae_scaling_factor, unet_channels = 0.18215, 4
 
-    # --- Locate vmfb files
+    
     names = {
         "unet": f"unet_{iree_target_backend}.vmfb",
         "text": f"text_encoder_{iree_target_backend}.vmfb",
@@ -59,7 +58,7 @@ def run_iree_inference(
         logger.error("Missing VMFB files – aborting IREE benchmark.")
         return None
 
-    # --- Create runtime + modules
+    
     cfg = ireert.Config(driver_name=iree_device)
     ctxs = {k: ireert.SystemContext(config=cfg) for k in ("unet", "text", "vae")}
     device = ireert.get_first_device()
@@ -74,7 +73,7 @@ def run_iree_inference(
         "vae": FunctionInvoker(ctxs["vae"].vm_context, device, modules["vae"].lookup_function("main_graph")),
     }
 
-    # --- Encode prompt
+    
     prompts = [prompt] * batch_size
     text_in = tokenizer(prompts, padding="max_length", max_length=tokenizer.model_max_length, truncation=True, return_tensors="pt")
     txt_ids_np = text_in.input_ids.numpy()
@@ -84,11 +83,11 @@ def run_iree_inference(
     uncond_emb = invokers["text"](uncond_ids_np)[0].to_host()
     text_embeddings = np.concatenate([uncond_emb, text_emb])
 
-    # --- Init latents
+    
     latents = np.random.randn(batch_size, unet_channels, height // 8, width // 8).astype("float32")
     latents = _multiply_sigma(latents, scheduler.init_noise_sigma)
 
-    # --- Denoise loop
+    
     scheduler.set_timesteps(num_inference_steps)
     text_t = torch.from_numpy(text_embeddings)
     latents_t = torch.from_numpy(latents)
@@ -104,7 +103,7 @@ def run_iree_inference(
 
     latents = latents_t.numpy()
 
-    # --- Decode
+    
     latents = latents / vae_scaling_factor
     image = invokers["vae"](latents)[0].to_host()
     image = (image / 2 + 0.5).clip(0, 1)

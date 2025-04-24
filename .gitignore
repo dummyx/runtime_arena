@@ -8,3 +8,9 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Exported models
+models/
+
+# Generated images
+*.png
