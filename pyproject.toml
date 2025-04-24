@@ -3,33 +3,41 @@ name = "runtime-arena"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.11,<3.12"
+requires-python = ">=3.12,<3.13"
 dependencies = [
-  "torch==2.5.1",
-  "torchvision==0.20.1",
-  "diffusers>=0.32.2",
-  "transformers>=4.48.3",
-  # "accelerate>=1.6.0",
-  "iree-base-compiler>=3.3.0",
-  "iree-base-runtime>=3.3.0",
-  "onnx>=1.17.0",
-  "onnxscript>=0.2.4",
   "ipython>=9.1.0",
+  
+  
+  "torch==2.6.0",
+  "torchvision==0.21.0",
+  
+
+  "diffusers>=0.32.2",
+  "transformers>=4.48.3", 
+  "accelerate>=1.6.0",
+  
+  
+  "mlc-ai-cu128==0.19.0",
+  
+  "iree-base-compiler>=3.3.0", 
+  "iree-base-runtime>=3.3.0",
   "iree-turbine>=3.3.0",
-  "setuptools>=78.1.0",
+
   "optimum[onnxruntime]>=1.24.0",
-  "onnxruntime>=1.21.0",
+  "onnxruntime-gpu>=1.21.1",
 ]
 
 [tool.uv.sources]
-torch = [
-  { index = "pytorch-cpu" },
-]
-torchvision = [
-  { index = "pytorch-cpu" },
-]
+torch = { index = "pytorch" }
+torchvision = { index = "pytorch" }
+mlc-ai-cu128 = { index = "mlc" }
 
 [[tool.uv.index]]
-name = "pytorch-cpu"
-url = "https://download.pytorch.org/whl/cpu"
+name = "pytorch"
+url = "https://download.pytorch.org/whl/cu126"
 explicit = true
+
+[[tool.uv.index]]
+name = "mlc"
+url = "https://mlc.ai/wheels"
+format = "flat"
